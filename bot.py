@@ -9,6 +9,7 @@ from datetime import datetime
 import pytz
 
 from aiogram import Bot, Dispatcher, Router, types, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from aiogram.filters import Command
@@ -24,16 +25,20 @@ from telethon.errors import (
 )
 
 # --- Config ---
-API_ID = 25781839  # Consider moving to environment variables
+API_ID = 25781839
 API_HASH = '20a3f2f168739259a180dcdd642e196c'
 BOT_TOKEN = '7857537951:AAG71zV2gsW3Eg97x2c2cVgoXzFCDZ3iHpU'
 OWNER_ID = 7584086775
 SESSIONS_FOLDER = "sessions"
-BATCH_SIZE = 5  # Number of parallel sessions to process
+BATCH_SIZE = 5
 MAX_RETRIES = 3
-MIN_DELAY = 2  # Minimum delay between messages in seconds
-MAX_DELAY = 4  # Maximum delay between messages in seconds
-MAX_MESSAGE_LENGTH = 4096  # Telegram message limit
+MIN_DELAY = 2
+MAX_DELAY = 4
+MAX_MESSAGE_LENGTH = 4096
+
+# Ensure sessions folder exists
+if not os.path.exists(SESSIONS_FOLDER):
+    os.makedirs(SESSIONS_FOLDER)
 
 # --- Logging ---
 logging.basicConfig(
@@ -62,7 +67,7 @@ class BotStates(StatesGroup):
     adding_session = State()
 
 # --- Bot Setup ---
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
@@ -85,7 +90,6 @@ def format_time(dt: datetime) -> str:
     return dt.astimezone(pytz.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
 
 def split_long_message(text: str) -> List[str]:
-    """Split long messages into chunks that fit Telegram's limit"""
     return [text[i:i+MAX_MESSAGE_LENGTH] for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
 
 # --- Keyboard Menus ---
@@ -126,10 +130,6 @@ def session_selection_keyboard(sessions: List[str], action: str) -> InlineKeyboa
 
 # --- Session Management ---
 async def load_sessions() -> None:
-    """Load and validate all sessions from the sessions folder"""
-    if not os.path.exists(SESSIONS_FOLDER):
-        os.makedirs(SESSIONS_FOLDER)
-    
     session_files = [f for f in os.listdir(SESSIONS_FOLDER) if f.endswith('.session')]
     
     for session_file in session_files:
@@ -137,7 +137,6 @@ async def load_sessions() -> None:
         if session_name not in active_sessions:
             active_sessions[session_name] = SessionInfo(name=session_name)
     
-    # Validate all sessions in parallel
     validation_tasks = []
     for session_name in active_sessions:
         validation_tasks.append(validate_session(session_name))
@@ -145,7 +144,6 @@ async def load_sessions() -> None:
     await asyncio.gather(*validation_tasks)
 
 async def validate_session(session_name: str) -> None:
-    """Check if a session is valid and get its phone number"""
     session_path = os.path.join(SESSIONS_FOLDER, f"{session_name}.session")
     client = TelegramClient(session_path, API_ID, API_HASH)
     
@@ -155,12 +153,10 @@ async def validate_session(session_name: str) -> None:
             active_sessions[session_name].valid = False
             return
         
-        # Get session info
         me = await client.get_me()
         active_sessions[session_name].phone = me.phone or ""
         active_sessions[session_name].valid = True
         
-        # Check if the account is limited
         try:
             await client(functions.account.GetAccountTTLRequest())
         except Exception as e:
@@ -176,7 +172,6 @@ async def validate_session(session_name: str) -> None:
         await client.disconnect()
 
 async def add_session_file(session_file: types.Document) -> Tuple[bool, str]:
-    """Add a new session file to the sessions folder"""
     if not session_file.file_name.endswith('.session'):
         return False, "File must have .session extension"
     
@@ -192,10 +187,11 @@ async def add_session_file(session_file: types.Document) -> Tuple[bool, str]:
         return True, f"Session {session_name} added successfully"
     except Exception as e:
         logger.error(f"Error adding session: {e}")
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
         return False, f"Failed to add session: {e}"
 
 async def remove_session(session_name: str) -> Tuple[bool, str]:
-    """Remove a session file"""
     session_path = os.path.join(SESSIONS_FOLDER, f"{session_name}.session")
     
     if not os.path.exists(session_path):
@@ -212,7 +208,6 @@ async def remove_session(session_name: str) -> Tuple[bool, str]:
 
 # --- Message Sending ---
 async def send_from_session(session_name: str, target: str, message: str, retry: int = 0) -> bool:
-    """Send a message from a specific session"""
     if session_name not in active_sessions or not active_sessions[session_name].valid:
         return False
     
@@ -229,7 +224,6 @@ async def send_from_session(session_name: str, target: str, message: str, retry:
         user = await client.get_entity(target)
         await client.send_message(user.id, message)
         
-        # Update session stats
         session_info.sent_count += 1
         session_info.last_used = get_current_time()
         return True
@@ -262,14 +256,12 @@ async def send_from_session(session_name: str, target: str, message: str, retry:
         await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
 async def send_bulk_messages(target: str, message: str) -> Dict[str, int]:
-    """Send messages using all valid sessions"""
     valid_sessions = [s.name for s in active_sessions.values() if s.valid]
     total_sessions = len(valid_sessions)
     
     if not valid_sessions:
         return {"sent": 0, "total": 0, "failed": 0}
     
-    # Process in batches to avoid overwhelming
     sent_count = 0
     failed_count = 0
     
@@ -281,7 +273,6 @@ async def send_bulk_messages(target: str, message: str) -> Dict[str, int]:
         sent_count += sum(results)
         failed_count += len(results) - sum(results)
     
-    # Update campaign stats
     campaign_stats["total_sent"] += sent_count
     campaign_stats["last_run"] = get_current_time()
     campaign_stats["target"] = target
@@ -310,32 +301,40 @@ async def start_handler(msg: types.Message):
 async def stats_command(msg: types.Message):
     if msg.from_user.id != OWNER_ID:
         return await msg.answer("🚫 Access denied.")
-    
     await show_statistics(msg)
 
 # --- Callback Handlers ---
 @router.callback_query(F.data == "main_menu")
 async def return_to_menu(query: types.CallbackQuery):
-    await query.message.edit_text(
-        "Main Menu:",
-        reply_markup=main_menu()
-    )
+    try:
+        await query.message.edit_text(
+            "Main Menu:",
+            reply_markup=main_menu()
+        )
+    except:
+        await query.answer("Main Menu")
 
 @router.callback_query(F.data == "cancel_action")
 async def cancel_action(query: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await query.message.edit_text(
-        "Action cancelled.",
-        reply_markup=main_menu()
-    )
+    try:
+        await query.message.edit_text(
+            "Action cancelled.",
+            reply_markup=main_menu()
+        )
+    except:
+        await query.answer("Action cancelled")
 
 @router.callback_query(F.data == "set_target")
 async def set_target_handler(query: types.CallbackQuery, state: FSMContext):
     await state.set_state(BotStates.setting_target)
-    await query.message.edit_text(
-        "📌 Send the target username or phone number (without @):",
-        reply_markup=cancel_button()
-    )
+    try:
+        await query.message.edit_text(
+            "📌 Send the target username or phone number (without @):",
+            reply_markup=cancel_button()
+        )
+    except:
+        await query.answer("Send the target username")
 
 @router.message(BotStates.setting_target)
 async def save_target(msg: types.Message, state: FSMContext):
@@ -350,10 +349,13 @@ async def save_target(msg: types.Message, state: FSMContext):
 @router.callback_query(F.data == "set_message")
 async def set_message_handler(query: types.CallbackQuery, state: FSMContext):
     await state.set_state(BotStates.setting_message)
-    await query.message.edit_text(
-        "💬 Send the message text you want to send:",
-        reply_markup=cancel_button()
-    )
+    try:
+        await query.message.edit_text(
+            "💬 Send the message text you want to send:",
+            reply_markup=cancel_button()
+        )
+    except:
+        await query.answer("Send the message text")
 
 @router.message(BotStates.setting_message)
 async def save_message(msg: types.Message, state: FSMContext):
@@ -373,17 +375,23 @@ async def save_message(msg: types.Message, state: FSMContext):
 @router.callback_query(F.data == "send_messages")
 async def send_messages_handler(query: types.CallbackQuery):
     if not campaign_stats.get("target") or not campaign_stats.get("message"):
-        await query.message.edit_text(
-            "⚠️ Please set both target and message first.",
-            reply_markup=main_menu()
-        )
+        try:
+            await query.message.edit_text(
+                "⚠️ Please set both target and message first.",
+                reply_markup=main_menu()
+            )
+        except:
+            await query.answer("Please set both target and message first.")
         return
     
-    await query.message.edit_text(
-        "🚀 Starting message sending process...\n"
-        f"Target: {hcode(campaign_stats['target'])}\n"
-        f"Message: {hcode(campaign_stats['message'][:50])}..."
-    )
+    try:
+        await query.message.edit_text(
+            "🚀 Starting message sending process...\n"
+            f"Target: {hcode(campaign_stats['target'])}\n"
+            f"Message: {hcode(campaign_stats['message'][:50])}..."
+        )
+    except:
+        await query.answer("Starting message sending process...")
     
     start_time = time.time()
     result = await send_bulk_messages(campaign_stats["target"], campaign_stats["message"])
@@ -396,10 +404,13 @@ async def send_messages_handler(query: types.CallbackQuery):
         f"📋 Total sessions: {result['total']}"
     )
     
-    await query.message.edit_text(
-        status_message,
-        reply_markup=main_menu()
-    )
+    try:
+        await query.message.edit_text(
+            status_message,
+            reply_markup=main_menu()
+        )
+    except:
+        await query.answer(status_message)
 
 @router.callback_query(F.data == "show_stats")
 async def show_stats_handler(query: types.CallbackQuery):
@@ -421,7 +432,6 @@ async def show_statistics(message: types.Message):
             f"• Last target: {hcode(campaign_stats.get('target', 'None'))}\n"
         )
     
-    # Add top performing sessions
     top_sessions = sorted(
         [s for s in active_sessions.values() if s.valid],
         key=lambda x: x.sent_count,
@@ -436,18 +446,27 @@ async def show_statistics(message: types.Message):
                 f"{session.sent_count} messages\n"
             )
     
-    await message.answer(
-        stats_message,
-        reply_markup=main_menu()
-    )
+    try:
+        await message.answer(
+            stats_message,
+            reply_markup=main_menu()
+        )
+    except:
+        for chunk in split_long_message(stats_message):
+            await message.answer(chunk)
 
 @router.callback_query(F.data == "add_session")
 async def add_session_handler(query: types.CallbackQuery, state: FSMContext):
     await state.set_state(BotStates.adding_session)
-    await query.message.edit_text(
-        "📲 Please upload a .session file:",
-        reply_markup=cancel_button()
-    )
+    try:
+        await query.message.edit_text(
+            "📲 Please upload a .session file:\n\n"
+            "1. Get session file from Telegram desktop\n"
+            "2. Upload it here",
+            reply_markup=cancel_button()
+        )
+    except:
+        await query.answer("Please upload a .session file")
 
 @router.message(BotStates.adding_session, F.document)
 async def handle_session_upload(msg: types.Message, state: FSMContext):
@@ -469,67 +488,88 @@ async def handle_session_upload(msg: types.Message, state: FSMContext):
 @router.callback_query(F.data == "remove_session")
 async def remove_session_handler(query: types.CallbackQuery):
     if not active_sessions:
-        await query.message.edit_text(
-            "No sessions available to remove.",
-            reply_markup=main_menu()
-        )
+        try:
+            await query.message.edit_text(
+                "No sessions available to remove.",
+                reply_markup=main_menu()
+            )
+        except:
+            await query.answer("No sessions available")
         return
     
-    await query.message.edit_text(
-        "Select a session to remove:",
-        reply_markup=session_selection_keyboard(
-            [s.name for s in active_sessions.values()],
-            "remove"
+    try:
+        await query.message.edit_text(
+            "Select a session to remove:",
+            reply_markup=session_selection_keyboard(
+                [s.name for s in active_sessions.values()],
+                "remove"
+            )
         )
-    )
+    except:
+        await query.answer("Select a session to remove")
 
 @router.callback_query(F.data.startswith("remove_"))
 async def confirm_remove_session(query: types.CallbackQuery):
     session_name = query.data.split("_", 1)[1]
-    await query.message.edit_text(
-        f"Are you sure you want to remove session {hcode(session_name)}?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Yes",
-                    callback_data=f"confirm_remove_{session_name}"
-                ),
-                InlineKeyboardButton(
-                    text="❌ No",
-                    callback_data="main_menu"
-                )
-            ]
-        ])
-    )
+    try:
+        await query.message.edit_text(
+            f"Are you sure you want to remove session {hcode(session_name)}?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Yes",
+                        callback_data=f"confirm_remove_{session_name}"
+                    ),
+                    InlineKeyboardButton(
+                        text="❌ No",
+                        callback_data="main_menu"
+                    )
+                ]
+            ])
+        )
+    except:
+        await query.answer(f"Confirm removal of {session_name}")
 
 @router.callback_query(F.data.startswith("confirm_remove_"))
 async def execute_remove_session(query: types.CallbackQuery):
     session_name = query.data.split("_", 2)[2]
     success, message = await remove_session(session_name)
-    await query.message.edit_text(
-        message,
-        reply_markup=main_menu()
-    )
+    try:
+        await query.message.edit_text(
+            message,
+            reply_markup=main_menu()
+        )
+    except:
+        await query.answer(message)
 
 @router.callback_query(F.data == "refresh_sessions")
 async def refresh_sessions_handler(query: types.CallbackQuery):
-    await query.message.edit_text("🔄 Refreshing session status...")
+    try:
+        await query.message.edit_text("🔄 Refreshing session status...")
+    except:
+        await query.answer("Refreshing sessions...")
     await load_sessions()
     valid_count = sum(1 for s in active_sessions.values() if s.valid)
-    await query.message.edit_text(
-        f"✅ Sessions refreshed\nValid sessions: {valid_count}/{len(active_sessions)}",
-        reply_markup=main_menu()
-    )
+    try:
+        await query.message.edit_text(
+            f"✅ Sessions refreshed\nValid sessions: {valid_count}/{len(active_sessions)}",
+            reply_markup=main_menu()
+        )
+    except:
+        await query.answer(f"Sessions refreshed: {valid_count} valid")
 
 # --- Error Handler ---
 @router.errors()
 async def error_handler(event: types.ErrorEvent):
     logger.error(f"Error occurred: {event.exception}", exc_info=True)
     if isinstance(event.update, types.CallbackQuery):
-        await event.update.message.answer(
-            "⚠️ An error occurred. Please try again.",
-            reply_markup=main_menu()
-        )
+        try:
+            await event.update.message.answer(
+                "⚠️ An error occurred. Please try again.",
+                reply_markup=main_menu()
+            )
+        except:
+            await event.update.answer("⚠️ An error occurred")
     elif isinstance(event.update, types.Message):
         await event.update.answer(
             "⚠️ An error occurred. Please try again.",
