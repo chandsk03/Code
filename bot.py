@@ -10,143 +10,129 @@ from telethon.errors import (
     PeerFloodError, FloodWaitError, UserPrivacyRestrictedError,
     UserIsBlockedError, SessionPasswordNeededError
 )
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils import executor
 from tqdm import tqdm
 
-# --- Telegram API Credentials ---
+# --- API Credentials ---
 API_ID = 25781839
 API_HASH = '20a3f2f168739259a180dcdd642e196c'
 
-# --- Configuration ---
+# --- Telegram Bot Token & Your User ID ---
+BOT_TOKEN = 'YOUR_BOT_TOKEN_HERE'
+OWNER_ID = 123456789  # Replace with your Telegram user ID
+
+# --- Config ---
 SESSIONS_FOLDER = "sessions"
 MIN_DELAY = 2
 MAX_DELAY = 4
 BATCH_SIZE = 5
 MAX_RETRIES = 3
 
+# --- Global State ---
+target_username = ""
+message_text = ""
+
 # --- Logging ---
-logging.basicConfig(
-    filename='telegram_sender.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(filename='telegram_sender.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger()
 
-# --- Utility ---
-def print_info(message: str): print(colored(f"[*] {message}", "blue"))
-def print_success(message: str): print(colored(f"[✓] {message}", "green"))
-def print_error(message: str): print(colored(f"[!] {message}", "red"))
-def print_warning(message: str): print(colored(f"[!] {message}", "yellow"))
+# --- Aiogram Bot ---
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
 
-# --- Session Check ---
+def log_console(msg): print(colored(msg, "cyan"))
+
+# --- Utility Functions ---
 async def is_session_valid(session_file: str) -> Optional[str]:
     session_name = os.path.splitext(session_file)[0]
     session_path = os.path.join(SESSIONS_FOLDER, session_name)
-
     client = TelegramClient(session_path, API_ID, API_HASH)
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            print_warning(f"Session '{session_name}' is unauthorized.")
             return None
         return session_name
-    except Exception as e:
-        print_error(f"Session check failed '{session_name}': {e}")
+    except:
         return None
     finally:
         await client.disconnect()
 
-# --- Message Sender ---
 async def send_from_session(session_name: str, target: str, message: str, retry_count: int = 0) -> bool:
     session_path = os.path.join(SESSIONS_FOLDER, session_name)
     client = TelegramClient(session_path, API_ID, API_HASH)
-
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            print_warning(f"Unauthorized session: {session_name}")
             return False
-
         user = await client.get_entity(target)
         await client.send_message(user.id, message)
-        print_success(f"Message sent from {session_name}")
         logger.info(f"Sent to {target} from {session_name}")
         return True
-
-    except UserPrivacyRestrictedError:
-        print_warning(f"Privacy restricted for {session_name}")
-    except UserIsBlockedError:
-        print_warning(f"Blocked by user: {session_name}")
+    except (UserPrivacyRestrictedError, UserIsBlockedError):
+        return False
     except PeerFloodError:
-        print_error(f"PeerFloodError in {session_name}")
         if retry_count < MAX_RETRIES:
-            wait = random.uniform(5, 10) * (retry_count + 1)
-            print_info(f"Retrying in {wait:.1f}s (attempt {retry_count + 1})...")
-            await asyncio.sleep(wait)
+            await asyncio.sleep(random.randint(5, 10))
             return await send_from_session(session_name, target, message, retry_count + 1)
     except FloodWaitError as e:
-        print_error(f"FloodWaitError: Wait {e.seconds}s in {session_name}")
         await asyncio.sleep(e.seconds)
         return await send_from_session(session_name, target, message, retry_count + 1)
-    except SessionPasswordNeededError:
-        print_error(f"2FA enabled (skipped): {session_name}")
-    except Exception as e:
-        print_error(f"Error in {session_name}: {e}")
+    except:
+        return False
     finally:
         await client.disconnect()
         await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
-    return False
 
-# --- Main Orchestration ---
-async def main():
-    print(colored("Welcome to the Telegram Message Sender!", "cyan"))
-    target = input(colored("Enter target username (without @): ", "cyan")).strip()
-    message = input(colored("Enter message to send: ", "cyan")).strip()
+# --- Bot Commands ---
+@dp.message_handler(commands=['start'])
+async def start_command(message: types.Message):
+    if message.from_user.id != OWNER_ID:
+        return await message.reply("Unauthorized.")
+    await message.reply("Welcome to the Telegram Bulk Sender Bot!\n\nUse:\n/target username\n/message your text\n/send")
 
-    if not target or not message:
-        print_error("Target or message is empty.")
+@dp.message_handler(commands=['target'])
+async def set_target(message: types.Message):
+    global target_username
+    if message.from_user.id != OWNER_ID:
         return
+    target_username = message.text.split(" ", 1)[1].strip()
+    await message.reply(f"Target set to: @{target_username}")
 
-    if not os.path.exists(SESSIONS_FOLDER):
-        print_error(f"Sessions folder '{SESSIONS_FOLDER}' not found.")
+@dp.message_handler(commands=['message'])
+async def set_message(message: types.Message):
+    global message_text
+    if message.from_user.id != OWNER_ID:
         return
+    message_text = message.text.split(" ", 1)[1].strip()
+    await message.reply("Message set!")
 
+@dp.message_handler(commands=['send'])
+async def send_bulk(message: types.Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    if not target_username or not message_text:
+        return await message.reply("Set target and message first using /target and /message.")
+
+    await message.reply("Checking sessions...")
     session_files = [f for f in os.listdir(SESSIONS_FOLDER) if f.endswith(".session")]
-    if not session_files:
-        print_error("No .session files found.")
-        return
-
-    print_info(f"Checking {len(session_files)} session(s)...")
-    valid_sessions = await asyncio.gather(*(is_session_valid(f) for f in session_files))
-    valid_sessions = [s for s in valid_sessions if s]
-
-    print_success(f"{len(valid_sessions)} valid session(s) found.")
+    valid = await asyncio.gather(*(is_session_valid(f) for f in session_files))
+    valid_sessions = [s for s in valid if s]
 
     if not valid_sessions:
-        print_error("No working sessions.")
-        return
+        return await message.reply("No valid sessions found!")
 
-    print_info(f"Sending messages to @{target}...")
+    await message.reply(f"Sending message to @{target_username} using {len(valid_sessions)} sessions...")
+
     sent = 0
+    for i in range(0, len(valid_sessions), BATCH_SIZE):
+        batch = valid_sessions[i:i+BATCH_SIZE]
+        results = await asyncio.gather(*(send_from_session(s, target_username, message_text) for s in batch))
+        sent += sum(results)
 
-    with tqdm(total=len(valid_sessions), bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as bar:
-        for i in range(0, len(valid_sessions), BATCH_SIZE):
-            batch = valid_sessions[i:i+BATCH_SIZE]
-            results = await asyncio.gather(*(send_from_session(s, target, message) for s in batch))
-            sent += sum(results)
-            bar.update(len(batch))
+    await message.reply(f"Done!\nMessages sent: {sent}/{len(valid_sessions)}")
 
-    # Summary
-    print_success("Finished message delivery.")
-    print("\nSummary:")
-    print(f"- Total sessions: {len(session_files)}")
-    print(f"- Valid sessions: {len(valid_sessions)}")
-    print(f"- Messages sent: {sent}")
-    print(f"- Failed: {len(valid_sessions) - sent}")
-
+# --- Bot Runner ---
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print_error("Interrupted by user.")
-    except Exception as e:
-        print_error(f"Unexpected error: {e}")
+    log_console("Bot is running...")
+    executor.start_polling(dp, skip_updates=True)
