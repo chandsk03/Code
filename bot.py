@@ -1,8 +1,9 @@
-import os  # Fixed import
+import os
 import time
 import random
 import asyncio
 import logging
+from typing import List, Optional
 from termcolor import colored
 from telethon.sync import TelegramClient
 from telethon.errors import (
@@ -10,139 +11,182 @@ from telethon.errors import (
     UserIsBlockedError, SessionPasswordNeededError
 )
 from tqdm import tqdm
-from typing import List, Optional  # Added for type hints
 
 # --- Telegram API Credentials ---
-api_id = 25781839
-api_hash = '20a3f2f168739259a180dcdd642e196c'
+API_ID = 25781839  # Replace with your own
+API_HASH = '20a3f2f168739259a180dcdd642e196c'  # Replace with your own
 
-# --- Config ---
+# --- Configuration ---
 SESSIONS_FOLDER = "sessions"
 MIN_DELAY = 2
 MAX_DELAY = 4
 BATCH_SIZE = 5
-MAX_RETRIES = 3  # Added retry mechanism
+MAX_RETRIES = 3
 
-# --- Inputs ---
-target_username = input("Enter target username (without @): ").strip()
-message_text = input("Enter message to send: ").strip()
-
-# --- Setup logging ---
+# --- Setup Logging ---
 logging.basicConfig(
-    filename='message_sender.log',
+    filename='telegram_sender.log',
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)  # Improved logger initialization
+logger = logging.getLogger(__name__)
 
+# --- Utility Functions ---
+def print_info(message: str) -> None:
+    print(colored(f"[*] {message}", "blue"))
+
+def print_success(message: str) -> None:
+    print(colored(f"[✓] {message}", "green"))
+
+def print_error(message: str) -> None:
+    print(colored(f"[!] {message}", "red"))
+
+def print_warning(message: str) -> None:
+    print(colored(f"[!] {message}", "yellow"))
+
+# --- Core Functions ---
 async def is_session_valid(session_file: str) -> Optional[str]:
     """Check if a session file is valid and authorized."""
     session_name = os.path.splitext(session_file)[0]
     session_path = os.path.join(SESSIONS_FOLDER, session_name)
     
-    async with TelegramClient(session_path, api_id, api_hash) as client:
+    async with TelegramClient(session_path, API_ID, API_HASH) as client:
         try:
             await client.connect()
             if not await client.is_user_authorized():
-                print(colored(f"[!] UNAUTHORIZED: {session_name}", "yellow"))
+                print_warning(f"Session '{session_name}' is unauthorized.")
                 logger.warning(f"Unauthorized session: {session_name}")
                 return None
-            return session_name
+            me = await client.get_me()
+            return me.phone  # Return phone number as session identifier
         except Exception as e:
+            print_error(f"Error checking session '{session_name}': {e}")
             logger.error(f"Error checking session {session_name}: {e}")
-            print(colored(f"[!] ERROR checking session {session_name}: {e}", "red"))
             return None
 
-async def send_from_session(session_name: str, retry_count: int = 0) -> None:
-    """Send message from a single session with retry logic."""
-    session_path = os.path.join(SESSIONS_FOLDER, session_name)
+async def send_from_session(session_phone: str, target: str, message: str, retry_count: int = 0) -> bool:
+    """Send a message from a session with retry logic."""
+    session_path = os.path.join(SESSIONS_FOLDER, session_phone)
+    success = False
     
-    async with TelegramClient(session_path, api_id, api_hash) as client:
+    async with TelegramClient(session_path, API_ID, API_HASH) as client:
         try:
             await client.start()
-            user = await client.get_entity(target_username)
-            await client.send_message(user.id, message_text)
-            print(colored(f"[+] Message sent from {session_name}", "green"))
-            logger.info(f"Message sent from {session_name}")
+            user = await client.get_entity(target)
+            await client.send_message(user.id, message)
+            print_success(f"Message sent successfully from {session_phone}")
+            logger.info(f"Message sent from {session_phone} to {target}")
+            success = True
         
         except UserPrivacyRestrictedError:
-            print(colored(f"[!] User privacy restricted in {session_name}", "yellow"))
-            logger.warning(f"User privacy restricted in {session_name}")
+            print_warning(f"User privacy restricted for {session_phone}")
+            logger.warning(f"Privacy restricted for {session_phone}")
         
         except UserIsBlockedError:
-            print(colored(f"[!] Blocked by user in {session_name}", "yellow"))
-            logger.warning(f"Blocked by user in {session_name}")
+            print_warning(f"Blocked by user from {session_phone}")
+            logger.warning(f"Blocked by user for {session_phone}")
         
-        except PeerFloodError as e:
-            print(colored(f"[!] SPAM DETECTED (PeerFloodError) in {session_name}", "red"))
-            logger.error(f"PeerFloodError in {session_name}")
+        except PeerFloodError:
+            print_error(f"Spam detected (PeerFloodError) for {session_phone}")
+            logger.error(f"PeerFloodError for {session_phone}")
             if retry_count < MAX_RETRIES:
-                wait_time = random.uniform(5, 10)
-                print(colored(f"[*] Retrying after {wait_time:.1f}s...", "yellow"))
+                wait_time = random.uniform(5, 10) * (retry_count + 1)
+                print_info(f"Retrying after {wait_time:.1f}s (Attempt {retry_count + 2}/{MAX_RETRIES + 1})")
                 await asyncio.sleep(wait_time)
-                await send_from_session(session_name, retry_count + 1)
+                return await send_from_session(session_phone, target, message, retry_count + 1)
         
         except FloodWaitError as e:
-            print(colored(f"[!] FloodWaitError: Sleeping {e.seconds}s ({session_name})", "red"))
-            logger.warning(f"FloodWaitError: Sleeping {e.seconds}s in {session_name}")
+            print_error(f"FloodWaitError: Waiting {e.seconds}s for {session_phone}")
+            logger.warning(f"FloodWaitError: Waiting {e.seconds}s for {session_phone}")
             await asyncio.sleep(e.seconds)
             if retry_count < MAX_RETRIES:
-                await send_from_session(session_name, retry_count + 1)
+                return await send_from_session(session_phone, target, message, retry_count + 1)
         
         except SessionPasswordNeededError:
-            print(colored(f"[!] 2FA enabled (not supported): {session_name}", "magenta"))
-            logger.error(f"2FA enabled in {session_name}")
+            print_error(f"2FA enabled (not supported) for {session_phone}")
+            logger.error(f"2FA enabled for {session_phone}")
         
         except Exception as e:
-            logger.error(f"Unexpected error in {session_name}: {e}")
-            print(colored(f"[!] Error in {session_name}: {e}", "red"))
+            print_error(f"Error sending from {session_phone}: {e}")
+            logger.error(f"Error for {session_phone}: {e}")
         
         finally:
             await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+    
+    return success
 
 async def main() -> None:
     """Main function to orchestrate the message sending process."""
+    # Welcome message
+    print(colored("Welcome to the Telegram Message Sender!", "cyan"))
+
+    # Get user inputs with validation
+    target = input(colored("Please enter the target username (without @): ", "cyan")).strip()
+    if not target:
+        print_error("Username cannot be empty.")
+        return
+    
+    message = input(colored("Please enter the message to send: ", "cyan")).strip()
+    if not message:
+        print_error("Message cannot be empty.")
+        return
+
+    # Check sessions folder
     if not os.path.exists(SESSIONS_FOLDER):
-        print(colored(f"[!] Folder '{SESSIONS_FOLDER}' not found!", "red"))
+        print_error(f"Folder '{SESSIONS_FOLDER}' not found!")
         logger.error(f"Session folder '{SESSIONS_FOLDER}' not found")
         return
 
     session_files = [f for f in os.listdir(SESSIONS_FOLDER) if f.endswith(".session")]
     if not session_files:
-        print(colored("[!] No .session files found!", "red"))
+        print_error("No .session files found!")
         logger.error("No session files found")
         return
 
-    print(colored(f"[*] Checking {len(session_files)} sessions...", "cyan"))
-    valid_sessions: List[str] = [
-        session_name 
-        for session_file in session_files 
-        if (session_name := await is_session_valid(session_file))
-    ]
-
+    # Validate sessions
+    print_info(f"Checking {len(session_files)} sessions in '{SESSIONS_FOLDER}' folder...")
+    valid_sessions: List[str] = []
+    tasks = [is_session_valid(f) for f in session_files]
+    results = await asyncio.gather(*tasks)
+    valid_sessions = [r for r in results if r is not None]
+    
+    invalid_count = len(session_files) - len(valid_sessions)
     if not valid_sessions:
-        print(colored("[!] No valid sessions found!", "red"))
+        print_error("No valid sessions found!")
         logger.error("No valid sessions found")
         return
+    
+    print_success(f"Found {len(valid_sessions)} valid session(s). ({invalid_count} invalid)")
 
-    print(colored(f"[✓] {len(valid_sessions)} valid sessions found.", "green"))
-    print(colored(f"[*] Sending messages to @{target_username}...", "cyan"))
-
-    with tqdm(total=len(valid_sessions), desc="Sending messages") as pbar:
+    # Send messages
+    print_info(f"Sending messages to @{target}...")
+    sent_count = 0
+    with tqdm(total=len(valid_sessions), bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as pbar:
         for i in range(0, len(valid_sessions), BATCH_SIZE):
             batch = valid_sessions[i:i + BATCH_SIZE]
-            await asyncio.gather(*(send_from_session(s) for s in batch))
+            results = await asyncio.gather(
+                *(send_from_session(s, target, message) for s in batch)
+            )
+            sent_count += sum(1 for r in results if r)
             pbar.update(len(batch))
 
-    print(colored("[✓] All messages sent.", "green"))
-    logger.info("All messages sent successfully")
+    # Summary
+    print_success("All messages sent successfully.")
+    print("\nSummary:")
+    print(f"- Total sessions: {len(session_files)}")
+    print(f"- Valid sessions: {len(valid_sessions)}")
+    print(f"- Messages sent: {sent_count}")
+    print(f"- Failed attempts: {len(valid_sessions) - sent_count}")
+
+    # Farewell
+    print(colored("\nThank you for using the Telegram Message Sender!", "cyan"))
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[!] Script interrupted by user.")
+        print_error("Script interrupted by user.")
         logger.warning("Script interrupted by user")
     except Exception as e:
-        print(colored(f"[!] Unexpected error: {e}", "red"))
-        logger.error(f"Unexpected error in main: {e}")
+        print_error(f"Unexpected error: {e}")
+        logger.error(f"Unexpected error: {e}")
