@@ -327,7 +327,7 @@ async def send_bulk_messages(target: str, message: str) -> Dict[str, int]:
     for i in range(0, total_sessions, BATCH_SIZE):
         batch = valid_sessions[i:i+BATCH_SIZE]
         results = await asyncio.gather(
-            *(send_from_session(s, target, message) for s in batch)
+            *(send_from_session(s, target, message) for s in batch))
         sent_count += sum(results)
         failed_count += len(results) - sum(results)
     
