@@ -5,45 +5,54 @@ import asyncio
 import logging
 from typing import List, Optional
 from termcolor import colored
-from telethon.sync import TelegramClient
+from telethon import TelegramClient
 from telethon.errors import (
     PeerFloodError, FloodWaitError, UserPrivacyRestrictedError,
     UserIsBlockedError, SessionPasswordNeededError
 )
-from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
-from tqdm import tqdm
-
-# --- API Credentials ---
-API_ID = 25781839
-API_HASH = '20a3f2f168739259a180dcdd642e196c'
-
-# --- Telegram Bot Token & Your User ID ---
-BOT_TOKEN = '7857537951:AAG71zV2gsW3Eg97x2c2cVgoXzFCDZ3iHpU'
-OWNER_ID = 7584086775  # Replace with your Telegram user ID
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.utils.markdown import hcode
+from aiogram.fsm.storage.memory import MemoryStorage
 
 # --- Config ---
+API_ID = 25781839
+API_HASH = '20a3f2f168739259a180dcdd642e196c'
+BOT_TOKEN = '7857537951:AAG71zV2gsW3Eg97x2c2cVgoXzFCDZ3iHpU'
+OWNER_ID = 758408677
+
 SESSIONS_FOLDER = "sessions"
 MIN_DELAY = 2
 MAX_DELAY = 4
 BATCH_SIZE = 5
 MAX_RETRIES = 3
 
-# --- Global State ---
+# --- Global state ---
 target_username = ""
 message_text = ""
 
-# --- Logging ---
+# --- Logger ---
 logging.basicConfig(filename='telegram_sender.log', level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
 
-# --- Aiogram Bot ---
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+# --- Bot setup ---
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher(storage=MemoryStorage())
 
-def log_console(msg): print(colored(msg, "cyan"))
+# --- Utilities ---
+def printc(msg): print(colored(msg, "cyan"))
 
-# --- Utility Functions ---
+def get_inline_menu():
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Set Target", callback_data="set_target"),
+         InlineKeyboardButton(text="Set Message", callback_data="set_message")],
+        [InlineKeyboardButton(text="Start Sending", callback_data="send")],
+        [InlineKeyboardButton(text="Session Stats", callback_data="admin")]
+    ])
+    return kb
+
 async def is_session_valid(session_file: str) -> Optional[str]:
     session_name = os.path.splitext(session_file)[0]
     session_path = os.path.join(SESSIONS_FOLDER, session_name)
@@ -84,55 +93,76 @@ async def send_from_session(session_name: str, target: str, message: str, retry_
         await client.disconnect()
         await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
-# --- Bot Commands ---
-@dp.message_handler(commands=['start'])
-async def start_command(message: types.Message):
+# --- Handlers ---
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
     if message.from_user.id != OWNER_ID:
         return await message.reply("Unauthorized.")
-    await message.reply("Welcome to the Telegram Bulk Sender Bot!\n\nUse:\n/target username\n/message your text\n/send")
+    await message.answer("Welcome to the Telegram Bulk Sender Bot!", reply_markup=get_inline_menu())
 
-@dp.message_handler(commands=['target'])
-async def set_target(message: types.Message):
-    global target_username
-    if message.from_user.id != OWNER_ID:
-        return
-    target_username = message.text.split(" ", 1)[1].strip()
-    await message.reply(f"Target set to: @{target_username}")
+@dp.callback_query(F.data == "set_target")
+async def cb_set_target(callback: types.CallbackQuery):
+    await callback.message.answer("Send me the target username (without @):")
+    await bot.send_chat_action(callback.from_user.id, "typing")
 
-@dp.message_handler(commands=['message'])
-async def set_message(message: types.Message):
-    global message_text
-    if message.from_user.id != OWNER_ID:
-        return
-    message_text = message.text.split(" ", 1)[1].strip()
-    await message.reply("Message set!")
+@dp.callback_query(F.data == "set_message")
+async def cb_set_message(callback: types.CallbackQuery):
+    await callback.message.answer("Send me the message to deliver:")
+    await bot.send_chat_action(callback.from_user.id, "typing")
 
-@dp.message_handler(commands=['send'])
-async def send_bulk(message: types.Message):
-    if message.from_user.id != OWNER_ID:
-        return
-    if not target_username or not message_text:
-        return await message.reply("Set target and message first using /target and /message.")
-
-    await message.reply("Checking sessions...")
+@dp.callback_query(F.data == "admin")
+async def cb_admin(callback: types.CallbackQuery):
     session_files = [f for f in os.listdir(SESSIONS_FOLDER) if f.endswith(".session")]
     valid = await asyncio.gather(*(is_session_valid(f) for f in session_files))
     valid_sessions = [s for s in valid if s]
+    invalid = len(session_files) - len(valid_sessions)
+    msg = (f"<b>Session Stats:</b>\n"
+           f"- Total: <code>{len(session_files)}</code>\n"
+           f"- Valid: <code>{len(valid_sessions)}</code>\n"
+           f"- Invalid: <code>{invalid}</code>")
+    await callback.message.answer(msg, reply_markup=get_inline_menu())
 
+@dp.callback_query(F.data == "send")
+async def cb_send(callback: types.CallbackQuery):
+    if not target_username or not message_text:
+        return await callback.message.answer("Set target and message first!")
+    session_files = [f for f in os.listdir(SESSIONS_FOLDER) if f.endswith(".session")]
+    valid = await asyncio.gather(*(is_session_valid(f) for f in session_files))
+    valid_sessions = [s for s in valid if s]
     if not valid_sessions:
-        return await message.reply("No valid sessions found!")
-
-    await message.reply(f"Sending message to @{target_username} using {len(valid_sessions)} sessions...")
+        return await callback.message.answer("No valid sessions found.")
+    
+    await callback.message.answer(f"Sending message to <b>@{target_username}</b> from <b>{len(valid_sessions)}</b> sessions...")
 
     sent = 0
     for i in range(0, len(valid_sessions), BATCH_SIZE):
-        batch = valid_sessions[i:i+BATCH_SIZE]
+        batch = valid_sessions[i:i + BATCH_SIZE]
         results = await asyncio.gather(*(send_from_session(s, target_username, message_text) for s in batch))
         sent += sum(results)
 
-    await message.reply(f"Done!\nMessages sent: {sent}/{len(valid_sessions)}")
+    await callback.message.answer(f"<b>Done!</b>\nSent: <code>{sent}/{len(valid_sessions)}</code>", reply_markup=get_inline_menu())
+
+@dp.message()
+async def collect_user_input(message: types.Message):
+    global target_username, message_text
+    if message.from_user.id != OWNER_ID:
+        return
+    if not target_username:
+        target_username = message.text.strip().replace("@", "")
+        await message.answer(f"Target set to <b>@{target_username}</b>", reply_markup=get_inline_menu())
+    elif not message_text:
+        message_text = message.text.strip()
+        await message.answer("Message content saved!", reply_markup=get_inline_menu())
+    else:
+        await message.answer("Use the buttons to proceed.", reply_markup=get_inline_menu())
 
 # --- Bot Runner ---
+async def main():
+    printc("Bot is running...")
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    log_console("Bot is running...")
-    executor.start_polling(dp, skip_updates=True)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print(colored("Bot stopped.", "red"))
