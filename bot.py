@@ -99,7 +99,14 @@ def is_valid_phone(phone: str) -> bool:
     return bool(re.match(r'^\+?[1-9]\d{7,14}$', phone))
 
 # --- Keyboard Menus ---
+def welcome_menu() -> InlineKeyboardMarkup:
+    """Initial welcome menu with just the BULK MESSAGE button"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 BULK MESSAGE", callback_data="show_full_menu")]
+    ])
+
 def main_menu() -> InlineKeyboardMarkup:
+    """Full menu shown after clicking BULK MESSAGE"""
     buttons = [
         [
             InlineKeyboardButton(text="📍 Set Target", callback_data="set_target"),
@@ -327,7 +334,8 @@ async def send_bulk_messages(target: str, message: str) -> Dict[str, int]:
     for i in range(0, total_sessions, BATCH_SIZE):
         batch = valid_sessions[i:i+BATCH_SIZE]
         results = await asyncio.gather(
-            *(send_from_session(s, target, message) for s in batch))
+            *(send_from_session(s, target, message) for s in batch)
+        )
         sent_count += sum(results)
         failed_count += len(results) - sum(results)
     
@@ -346,15 +354,15 @@ async def send_bulk_messages(target: str, message: str) -> Dict[str, int]:
 # --- Command Handlers ---
 @router.message(Command("start"))
 async def start_handler(msg: types.Message):
-    """Handle /start command"""
+    """Handle /start command with new welcome flow"""
     if msg.from_user.id != OWNER_ID:
         return await msg.answer("🚫 Access denied.")
     
     await msg.answer(
         f"👋 Welcome {hbold(msg.from_user.first_name)}!\n"
-        "This is an advanced Telegram message sender bot.\n"
-        "Use the buttons below to control the bot:",
-        reply_markup=main_menu()
+        "This is an advanced Telegram bulk message sender bot.\n"
+        "Click the button below to get started:",
+        reply_markup=welcome_menu()
     )
 
 @router.message(Command("stats"))
@@ -365,6 +373,17 @@ async def stats_command(msg: types.Message):
     await show_statistics(msg)
 
 # --- Callback Handlers ---
+@router.callback_query(F.data == "show_full_menu")
+async def show_full_menu_handler(query: types.CallbackQuery):
+    """Show the full menu after clicking BULK MESSAGE"""
+    try:
+        await query.message.edit_text(
+            "📋 Main Menu - Select an option:",
+            reply_markup=main_menu()
+        )
+    except:
+        await query.answer("Main Menu")
+
 @router.callback_query(F.data == "main_menu")
 async def return_to_menu(query: types.CallbackQuery):
     """Return to main menu"""
