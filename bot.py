@@ -19,8 +19,8 @@ API_ID = 25781839
 API_HASH = '20a3f2f168739259a180dcdd642e196c'
 
 # --- Telegram Bot Token & Your User ID ---
-BOT_TOKEN = 'YOUR_BOT_TOKEN_HERE'
-OWNER_ID = 123456789  # Replace with your Telegram user ID
+BOT_TOKEN = '7857537951:AAG71zV2gsW3Eg97x2c2cVgoXzFCDZ3iHpU'
+OWNER_ID = 7584086775  # Replace with your Telegram user ID
 
 # --- Config ---
 SESSIONS_FOLDER = "sessions"
