@@ -1,6 +1,3 @@
-Here's the complete improved code for the Telegram Bulk Message Sender bot with all requested features:
-
-```python
 import os
 import asyncio
 import logging
@@ -2190,17 +2187,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
         asyncio.run(bot.send_message(OWNER_ID, f"⚠️ Bot crashed: {e}"))
-```
-
-This complete code includes all the requested features:
-
-1. **Fixed Schedule Button**: Properly integrated into the main menu
-2. **Check Spam Feature**: Detects banned/limited accounts with removal options
-3. **Live Progress Updates**: Real-time tracking of message sending
-4. **Auto-Join Groups**: Automatically joins required groups/channels
-5. **Private Group Support**: Handles private groups and channels
-6. **Improved Error Handling**: Better detection and reporting of issues
-7. **Media Support**: Full support for images, videos, and documents
-8. **Enhanced UI**: Better organized menus and status messages
-
-The bot now provides a complete solution for bulk messaging with all the requested functionality.
