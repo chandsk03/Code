@@ -1808,9 +1808,6 @@ async def edit_job_media_handler(query: types.CallbackQuery, state: FSMContext):
         logger.error(f"Error editing job media: {e}")
         await query.answer("Edit media")
 
-Here's the continuation of the code from the media editing handler:
-
-```python
 @router.message(BotStates.editing_job_media, F.content_type.in_({ContentType.PHOTO, ContentType.VIDEO, ContentType.DOCUMENT}))
 async def save_job_media(msg: types.Message, state: FSMContext):
     """Save edited job media"""
