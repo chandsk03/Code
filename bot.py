@@ -178,7 +178,7 @@ def schedule_job(job_id: str, targets: List[str], message: str, interval: int, n
     scheduler.add_job(
         send_scheduled_messages,
         trigger=IntervalTrigger(minutes=interval),
-        args=[targets, message],
+        args=[job_id, targets, message],
         id=job_id,
         next_run_time=next_run
     )
@@ -198,7 +198,7 @@ def delete_job(job_id: str):
             return False
     return False
 
-async def send_scheduled_messages(targets: List[str], message: str):
+async def send_scheduled_messages(job_id: str, targets: List[str], message: str):
     """Send messages to multiple groups on schedule"""
     valid_sessions = [s.name for s in active_sessions.values() if s.valid]
     if not valid_sessions:
@@ -212,7 +212,6 @@ async def send_scheduled_messages(targets: List[str], message: str):
         logger.info(f"Scheduled send to {target}: {result['sent']}/{result['total']} successful")
     
     # Update next run time
-    job_id = scheduler.current_job.id
     if job_id in scheduled_jobs:
         scheduled_jobs[job_id].next_run = get_current_time() + timedelta(
             minutes=scheduled_jobs[job_id].interval
@@ -501,7 +500,11 @@ async def send_from_session(session_name: str, target: str, message: str, retry:
         try:
             # Improved entity resolution
             if target.startswith('+') and is_valid_phone(target):
-                user = await client.get_entity(target)
+                try:
+                    user = await client.get_entity(target)
+                except ValueError:
+                    logger.warning(f"Invalid phone number: {target}")
+                    return False
             elif target.startswith('@'):
                 user = await client.get_entity(target)
             else:
@@ -651,7 +654,7 @@ async def set_target_handler(query: types.CallbackQuery, state: FSMContext):
 @router.message(BotStates.setting_target)
 async def save_target(msg: types.Message, state: FSMContext):
     """Save target information"""
-    target = msg.text.strip()
+    target = msg.text.strip() if msg.text else ""
     if not target:
         await msg.answer("Please enter a valid target", reply_markup=cancel_button())
         return
@@ -681,6 +684,10 @@ async def set_message_handler(query: types.CallbackQuery, state: FSMContext):
 @router.message(BotStates.setting_message)
 async def save_message(msg: types.Message, state: FSMContext):
     """Save message content"""
+    if not msg.text:
+        await msg.answer("Please enter a valid message", reply_markup=cancel_button())
+        return
+    
     message = msg.text.strip()
     if not message:
         await msg.answer("Please enter a valid message", reply_markup=cancel_button())
@@ -949,8 +956,8 @@ async def remove_session_handler(query: types.CallbackQuery, state: FSMContext):
             logger.error(f"Error removing session: {e}")
             await query.answer("No sessions available")
         return
-        
-        await state.set_state(BotStates.removing_session)
+    
+    await state.set_state(BotStates.removing_session)
     try:
         await query.message.edit_text(
             "Select a session to remove:",
@@ -1088,7 +1095,7 @@ async def run_job_handler(query: types.CallbackQuery):
     job = scheduled_jobs[job_id]
     await query.answer("Running job now...")
     
-    result = await send_scheduled_messages(job.targets, job.message)
+    result = await send_scheduled_messages(job.job_id, job.targets, job.message)
     try:
         await query.message.answer(
             f"✅ Ran schedule {job_id[:6]}...\n"
