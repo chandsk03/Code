@@ -12,8 +12,8 @@ import pytz
 
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.enums import ParseMode, ContentType
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -41,15 +41,12 @@ MIN_DELAY = 2  # seconds between messages
 MAX_DELAY = 4  # seconds between messages
 MAX_MESSAGE_LENGTH = 4096  # Telegram message limit
 
-# --- Initialization ---
-if not os.path.exists(SESSIONS_FOLDER):
-    os.makedirs(SESSIONS_FOLDER)
-
+# Configure logging to only show errors
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.ERROR,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('bot.log'),
+        logging.FileHandler('bot_errors.log'),
         logging.StreamHandler()
     ]
 )
@@ -67,10 +64,11 @@ class SessionInfo:
     is_premium: bool = False
 
 class ScheduledJob:
-    def __init__(self, job_id: str, targets: List[str], message: str, interval: int, next_run: datetime):
+    def __init__(self, job_id: str, targets: List[str], message: str, media: Optional[str] = None, interval: int = 0, next_run: datetime = None):
         self.job_id = job_id
         self.targets = targets
         self.message = message
+        self.media = media
         self.interval = interval
         self.next_run = next_run
 
@@ -84,7 +82,9 @@ class BotStates(StatesGroup):
     managing_schedules = State()
     editing_job_targets = State()
     editing_job_message = State()
+    editing_job_media = State()
     editing_job_interval = State()
+    setting_media = State()
 
 # --- Bot Setup ---
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -100,10 +100,11 @@ campaign_stats = {
     "total_sent": 0,
     "last_run": None,
     "target": "",
-    "message": ""
+    "message": "",
+    "media": None
 }
 
-# Initialize scheduler (will be started in on_startup)
+# Initialize scheduler
 scheduler = AsyncIOScheduler(timezone="UTC")
 
 # --- Helper Functions ---
@@ -130,8 +131,9 @@ async def save_schedules():
         job_id: {
             "targets": job.targets,
             "message": job.message,
+            "media": job.media,
             "interval": job.interval,
-            "next_run": job.next_run.isoformat()
+            "next_run": job.next_run.isoformat() if job.next_run else None
         }
         for job_id, job in scheduled_jobs.items()
     }
@@ -148,21 +150,22 @@ async def load_schedules():
             data = json.load(f)
         
         for job_id, job_data in data.items():
-            next_run = datetime.fromisoformat(job_data["next_run"])
-            if next_run > get_current_time():
+            next_run = datetime.fromisoformat(job_data["next_run"]) if job_data["next_run"] else None
+            if not next_run or next_run > get_current_time():
                 schedule_job(
                     job_id,
                     job_data["targets"],
                     job_data["message"],
+                    job_data.get("media"),
                     job_data["interval"],
                     next_run
                 )
     except Exception as e:
         logger.error(f"Error loading schedules: {e}")
 
-def schedule_job(job_id: str, targets: List[str], message: str, interval: int, next_run: datetime = None):
+def schedule_job(job_id: str, targets: List[str], message: str, media: Optional[str] = None, interval: int = 0, next_run: datetime = None):
     """Create or update a scheduled job"""
-    if not next_run:
+    if not next_run and interval > 0:
         next_run = get_current_time() + timedelta(minutes=interval)
     
     # Remove existing job if it exists
@@ -170,18 +173,19 @@ def schedule_job(job_id: str, targets: List[str], message: str, interval: int, n
         try:
             scheduler.remove_job(job_id)
         except Exception as e:
-            logger.warning(f"Error removing job {job_id}: {e}")
+            logger.error(f"Error removing job {job_id}: {e}")
     
-    job = ScheduledJob(job_id, targets, message, interval, next_run)
+    job = ScheduledJob(job_id, targets, message, media, interval, next_run)
     scheduled_jobs[job_id] = job
     
-    scheduler.add_job(
-        send_scheduled_messages,
-        trigger=IntervalTrigger(minutes=interval),
-        args=[job_id, targets, message],
-        id=job_id,
-        next_run_time=next_run
-    )
+    if interval > 0:
+        scheduler.add_job(
+            send_scheduled_messages,
+            trigger=IntervalTrigger(minutes=interval),
+            args=[job_id, targets, message, media],
+            id=job_id,
+            next_run_time=next_run
+        )
     
     asyncio.create_task(save_schedules())
 
@@ -198,21 +202,21 @@ def delete_job(job_id: str):
             return False
     return False
 
-async def send_scheduled_messages(job_id: str, targets: List[str], message: str):
+async def send_scheduled_messages(job_id: str, targets: List[str], message: str, media: Optional[str] = None):
     """Send messages to multiple groups on schedule"""
     valid_sessions = [s.name for s in active_sessions.values() if s.valid]
     if not valid_sessions:
-        logger.warning("No valid sessions for scheduled messages")
+        logger.error("No valid sessions for scheduled messages")
         return
     
     results = []
     for target in targets:
-        result = await send_bulk_messages(target, message)
+        result = await send_bulk_messages(target, message, media)
         results.append(result)
         logger.info(f"Scheduled send to {target}: {result['sent']}/{result['total']} successful")
     
     # Update next run time
-    if job_id in scheduled_jobs:
+    if job_id in scheduled_jobs and scheduled_jobs[job_id].interval > 0:
         scheduled_jobs[job_id].next_run = get_current_time() + timedelta(
             minutes=scheduled_jobs[job_id].interval
         )
@@ -229,7 +233,7 @@ async def send_scheduled_messages(job_id: str, targets: List[str], message: str)
             f"Failures: {sum(r['failed'] for r in results)}"
         )
 
-async def send_bulk_messages(target: str, message: str) -> Dict[str, int]:
+async def send_bulk_messages(target: str, message: str, media: Optional[str] = None) -> Dict[str, int]:
     """Send messages using all valid sessions with batch processing"""
     valid_sessions = [s.name for s in active_sessions.values() if s.valid]
     total_sessions = len(valid_sessions)
@@ -244,7 +248,7 @@ async def send_bulk_messages(target: str, message: str) -> Dict[str, int]:
     for i in range(0, total_sessions, BATCH_SIZE):
         batch = valid_sessions[i:i+BATCH_SIZE]
         results = await asyncio.gather(
-            *(send_from_session(s, target, message) for s in batch),
+            *(send_from_session(s, target, message, media) for s in batch),
             return_exceptions=True
         )
         
@@ -262,6 +266,7 @@ async def send_bulk_messages(target: str, message: str) -> Dict[str, int]:
     campaign_stats["last_run"] = get_current_time()
     campaign_stats["target"] = target
     campaign_stats["message"] = message
+    campaign_stats["media"] = media
     
     return {
         "sent": sent_count,
@@ -282,16 +287,20 @@ def main_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="💬 Set Message", callback_data="set_message")
         ],
         [
-            InlineKeyboardButton(text="🚀 Send Messages", callback_data="send_messages"),
+            InlineKeyboardButton(text="🖼 Set Media", callback_data="set_media"),
             InlineKeyboardButton(text="📊 Statistics", callback_data="show_stats")
+        ],
+        [
+            InlineKeyboardButton(text="🚀 Send Messages", callback_data="send_messages"),
+            InlineKeyboardButton(text="⏰ Schedule", callback_data="schedule_messages")
         ],
         [
             InlineKeyboardButton(text="➕ Add Session", callback_data="add_session"),
             InlineKeyboardButton(text="🗑 Remove Session", callback_data="remove_session")
         ],
         [
-            InlineKeyboardButton(text="⏰ Manage Schedules", callback_data="manage_schedules"),
-            InlineKeyboardButton(text="🔄 Refresh", callback_data="refresh_sessions")
+            InlineKeyboardButton(text="🔄 Refresh", callback_data="refresh_sessions"),
+            InlineKeyboardButton(text="📅 Manage Schedules", callback_data="manage_schedules")
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -321,9 +330,10 @@ def send_options() -> InlineKeyboardMarkup:
 def schedule_keyboard(schedules: List[ScheduledJob]) -> InlineKeyboardMarkup:
     buttons = []
     for job in schedules:
-        time_left = format_timedelta(job.next_run - get_current_time())
+        time_left = format_timedelta(job.next_run - get_current_time()) if job.next_run else "Now"
+        has_media = "📎" if job.media else ""
         buttons.append([InlineKeyboardButton(
-            text=f"⏰ {job.job_id[:6]}... | {len(job.targets)} groups | Every {job.interval}m | Next: {time_left}",
+            text=f"⏰ {job.job_id[:6]}... | {len(job.targets)} groups | Every {job.interval}m | Next: {time_left} {has_media}",
             callback_data=f"manage_job_{job.job_id}"
         )])
     buttons.append([InlineKeyboardButton(text="➕ New Schedule", callback_data="schedule_messages")])
@@ -348,6 +358,10 @@ def edit_job_keyboard(job_id: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="📌 Edit Targets", callback_data=f"edit_targets_{job_id}"),
             InlineKeyboardButton(text="💬 Edit Message", callback_data=f"edit_message_{job_id}")
+        ],
+        [
+            InlineKeyboardButton(text="🖼 Edit Media", callback_data=f"edit_media_{job_id}"),
+            InlineKeyboardButton(text="⏱ Edit Interval", callback_data=f"change_interval_{job_id}")
         ],
         [InlineKeyboardButton(text="⬅️ Back", callback_data=f"manage_job_{job_id}")]
     ])
@@ -376,7 +390,7 @@ async def validate_session(session_name: str) -> bool:
         await client.connect()
         
         if not await client.is_user_authorized():
-            logger.warning(f"Session {session_name} not authorized")
+            logger.error(f"Session {session_name} not authorized")
             return False
         
         me = await client.get_me()
@@ -396,12 +410,12 @@ async def validate_session(session_name: str) -> bool:
             await client(functions.account.GetAccountTTLRequest())
             return True
         except Exception as e:
-            logger.warning(f"Account {session_name} might be limited: {e}")
+            logger.error(f"Account {session_name} might be limited: {e}")
             active_sessions[session_name].valid = False
             return False
             
     except (SessionRevokedError, AuthKeyError):
-        logger.warning(f"Session {session_name} revoked or auth error")
+        logger.error(f"Session {session_name} revoked or auth error")
         return False
     except Exception as e:
         logger.error(f"Error validating session {session_name}: {str(e)}")
@@ -478,11 +492,11 @@ async def remove_session_file(session_name: str) -> Tuple[bool, str]:
         logger.error(f"Error removing session {session_name}: {str(e)}")
         return False, f"❌ Failed to remove session: {str(e)}"
 
-# --- Enhanced Message Sending ---
-async def send_from_session(session_name: str, target: str, message: str, retry: int = 0) -> bool:
-    """Improved message sending with better error handling"""
+# --- Enhanced Message Sending with Media Support ---
+async def send_from_session(session_name: str, target: str, message: str, media_path: Optional[str] = None, retry: int = 0) -> bool:
+    """Improved message sending with better error handling and media support"""
     if session_name not in active_sessions or not active_sessions[session_name].valid:
-        logger.warning(f"Session {session_name} not valid")
+        logger.error(f"Session {session_name} not valid")
         return False
     
     session_info = active_sessions[session_name]
@@ -494,7 +508,7 @@ async def send_from_session(session_name: str, target: str, message: str, retry:
         
         if not await client.is_user_authorized():
             session_info.valid = False
-            logger.warning(f"Session {session_name} not authorized")
+            logger.error(f"Session {session_name} not authorized")
             return False
         
         try:
@@ -503,26 +517,39 @@ async def send_from_session(session_name: str, target: str, message: str, retry:
                 try:
                     user = await client.get_entity(target)
                 except ValueError:
-                    logger.warning(f"Invalid phone number: {target}")
+                    logger.error(f"Invalid phone number: {target}")
                     return False
             elif target.startswith('@'):
                 user = await client.get_entity(target)
             else:
                 user = await client.get_entity(f'@{target.lstrip("@")}')
         except ValueError as e:
-            logger.warning(f"Invalid target {target}: {e}")
+            logger.error(f"Invalid target {target}: {e}")
             return False
         except Exception as e:
-            logger.warning(f"Error resolving {target}: {e}")
+            logger.error(f"Error resolving {target}: {e}")
             return False
         
-        # Send message with markdown support
+        # Send message with media support
         try:
-            await client.send_message(
-                user.id, 
-                message,
-                parse_mode='md' if any(c in message for c in '*_`[') else None
-            )
+            if media_path and os.path.exists(media_path):
+                # Determine media type by extension
+                ext = os.path.splitext(media_path)[1].lower()
+                if ext in ('.jpg', '.jpeg', '.png'):
+                    await client.send_file(user.id, media_path, caption=message)
+                elif ext in ('.mp4', '.mov', '.avi'):
+                    await client.send_file(user.id, media_path, caption=message, supports_streaming=True)
+                elif ext in ('.pdf', '.doc', '.docx', '.txt'):
+                    await client.send_file(user.id, media_path, caption=message, force_document=True)
+                else:
+                    await client.send_file(user.id, media_path, caption=message)
+            else:
+                # Send text message only
+                await client.send_message(
+                    user.id, 
+                    message,
+                    parse_mode='md' if any(c in message for c in '*_`[') else None
+                )
             
             # Update session stats
             session_info.sent_count += 1
@@ -530,18 +557,18 @@ async def send_from_session(session_name: str, target: str, message: str, retry:
             return True
             
         except PeerFloodError:
-            logger.warning(f"Peer flood error from {session_name}")
+            logger.error(f"Peer flood error from {session_name}")
             session_info.errors += 1
             return False
         except FloodWaitError as e:
-            logger.warning(f"Flood wait for {e.seconds} seconds from {session_name}")
+            logger.error(f"Flood wait for {e.seconds} seconds from {session_name}")
             await asyncio.sleep(e.seconds)
             return False
         except (UserPrivacyRestrictedError, UserIsBlockedError):
-            logger.warning(f"Privacy restriction from {session_name}")
+            logger.error(f"Privacy restriction from {session_name}")
             return False
         except Exception as e:
-            logger.warning(f"Send error from {session_name} to {target}: {e}")
+            logger.error(f"Send error from {session_name} to {target}: {e}")
             session_info.errors += 1
             return False
     
@@ -561,11 +588,14 @@ async def send_from_session(session_name: str, target: str, message: str, retry:
 async def start_handler(msg: types.Message):
     """Handle /start command with new welcome flow"""
     if msg.from_user.id != OWNER_ID:
-        return await msg.answer("🚫 Access denied.")
+        return await msg.answer("🚫 Access denied. This bot is private.")
     
     await msg.answer(
         f"👋 Welcome {hbold(msg.from_user.first_name)}!\n"
-        "This is an advanced Telegram bulk message sender bot.\n"
+        "This is an advanced Telegram bulk message sender bot with:\n"
+        "- Multi-user group messaging\n"
+        "- Media/file attachments\n"
+        "- Scheduling capabilities\n\n"
         "Click the button below to get started:",
         reply_markup=welcome_menu()
     )
@@ -584,7 +614,8 @@ async def help_command(msg: types.Message):
         "📚 Bot Help Guide:\n\n"
         "1. First add session files (.session)\n"
         "2. Set target (username/phone) and message\n"
-        "3. Choose to send now or schedule\n\n"
+        "3. Optionally attach media (image, video, document)\n"
+        "4. Choose to send now or schedule\n\n"
         "⏰ Scheduling:\n"
         "- Set interval in minutes (e.g., 15)\n"
         "- Manage active schedules\n"
@@ -640,11 +671,11 @@ async def set_target_handler(query: types.CallbackQuery, state: FSMContext):
     await state.set_state(BotStates.setting_target)
     try:
         await query.message.edit_text(
-            "📌 Send the target username or phone number (without @):\n"
-            "Examples:\n"
-            "- username: username\n"
-            "- phone: +1234567890\n"
-            "- multiple: group1,group2 (for schedules)",
+            "📌 Send the target username or phone number:\n"
+            "• For single target: username or +1234567890\n"
+            "• For multiple targets: group1,group2,group3\n"
+            "• For channels: @channelusername\n\n"
+            "Note: The bot accounts must be members of the groups/channels",
             reply_markup=cancel_button()
         )
     except Exception as e:
@@ -674,7 +705,8 @@ async def set_message_handler(query: types.CallbackQuery, state: FSMContext):
         await query.message.edit_text(
             "💬 Send the message text you want to send:\n"
             "Supports Markdown formatting:\n"
-            "*bold*, _italic_, `code`, [link](url)",
+            "*bold*, _italic_, `code`, [link](url)\n\n"
+            "For long messages, they will be automatically split.",
             reply_markup=cancel_button()
         )
     except Exception as e:
@@ -705,6 +737,75 @@ async def save_message(msg: types.Message, state: FSMContext):
         reply_markup=main_menu()
     )
 
+@router.callback_query(F.data == "set_media")
+async def set_media_handler(query: types.CallbackQuery, state: FSMContext):
+    """Initiate media setting"""
+    await state.set_state(BotStates.setting_media)
+    try:
+        await query.message.edit_text(
+            "🖼 Send an image, video, or document to attach to your message:\n"
+            "Supported formats:\n"
+            "- Images: JPG, PNG\n"
+            "- Videos: MP4, MOV\n"
+            "- Documents: PDF, DOC, TXT\n\n"
+            "Send /cancel to skip media attachment.",
+            reply_markup=cancel_button()
+        )
+    except Exception as e:
+        logger.error(f"Error setting media: {e}")
+        await query.answer("Send media file")
+
+@router.message(BotStates.setting_media, F.content_type.in_({ContentType.PHOTO, ContentType.VIDEO, ContentType.DOCUMENT}))
+async def save_media(msg: types.Message, state: FSMContext):
+    """Save media file"""
+    try:
+        # Create media folder if not exists
+        if not os.path.exists("media"):
+            os.makedirs("media")
+        
+        # Determine file type and extension
+        if msg.photo:
+            file_id = msg.photo[-1].file_id
+            ext = ".jpg"
+        elif msg.video:
+            file_id = msg.video.file_id
+            ext = ".mp4"
+        elif msg.document:
+            file_id = msg.document.file_id
+            ext = os.path.splitext(msg.document.file_name)[1] if msg.document.file_name else ".bin"
+        
+        # Download the file
+        file = await bot.get_file(file_id)
+        media_path = f"media/{file_id}{ext}"
+        await bot.download_file(file.file_path, media_path)
+        
+        # Save to campaign stats
+        campaign_stats["media"] = media_path
+        await state.clear()
+        
+        # Show confirmation with file type
+        file_type = "photo" if msg.photo else "video" if msg.video else "document"
+        await msg.answer(
+            f"✅ {file_type.capitalize()} attached successfully!",
+            reply_markup=main_menu()
+        )
+    except Exception as e:
+        logger.error(f"Error saving media: {e}")
+        await msg.answer(
+            "❌ Failed to save media. Please try again.",
+            reply_markup=cancel_button()
+        )
+
+@router.message(BotStates.setting_media, Command("cancel"))
+async def cancel_media(msg: types.Message, state: FSMContext):
+    """Cancel media attachment"""
+    campaign_stats["media"] = None
+    await state.clear()
+    await msg.answer(
+        "Media attachment cancelled.",
+        reply_markup=main_menu()
+    )
+
 @router.callback_query(F.data == "send_messages")
 async def send_messages_handler(query: types.CallbackQuery):
     """Handle message sending options"""
@@ -720,10 +821,12 @@ async def send_messages_handler(query: types.CallbackQuery):
         return
     
     try:
+        media_status = "📎 Media attached" if campaign_stats.get("media") else "No media"
         await query.message.edit_text(
             "Choose how you want to send:\n"
             f"Target: {hcode(campaign_stats['target'])}\n"
-            f"Message: {hcode(campaign_stats['message'][:50])}...",
+            f"Message: {hcode(campaign_stats['message'][:50])}...\n"
+            f"{media_status}",
             reply_markup=send_options()
         )
     except Exception as e:
@@ -740,7 +843,11 @@ async def send_now_handler(query: types.CallbackQuery):
         await query.answer("Sending messages...")
     
     start_time = time.time()
-    result = await send_bulk_messages(campaign_stats["target"], campaign_stats["message"])
+    result = await send_bulk_messages(
+        campaign_stats["target"],
+        campaign_stats["message"],
+        campaign_stats.get("media")
+    )
     elapsed = time.time() - start_time
     
     status_message = (
@@ -764,8 +871,10 @@ async def schedule_current_handler(query: types.CallbackQuery, state: FSMContext
     """Schedule current message"""
     await state.set_state(BotStates.setting_interval)
     try:
+        media_status = "with media" if campaign_stats.get("media") else "without media"
         await query.message.edit_text(
-            "⏳ Enter interval in minutes (e.g., 15 for every 15 minutes):",
+            f"⏳ Scheduling message {media_status}\n"
+            "Enter interval in minutes (e.g., 15 for every 15 minutes):",
             reply_markup=cancel_button()
         )
     except Exception as e:
@@ -789,12 +898,19 @@ async def save_schedule_interval(msg: types.Message, state: FSMContext):
         return
     
     job_id = f"job_{int(time.time())}"
-    schedule_job(job_id, targets, campaign_stats["message"], interval)
+    schedule_job(
+        job_id,
+        targets,
+        campaign_stats["message"],
+        campaign_stats.get("media"),
+        interval
+    )
     
     await state.clear()
     await msg.answer(
         f"✅ Scheduled messages every {interval} minutes\n"
         f"Targets: {', '.join(targets)}\n"
+        f"Media: {'Yes' if campaign_stats.get('media') else 'No'}\n"
         f"Job ID: {job_id[:8]}...",
         reply_markup=main_menu()
     )
@@ -822,10 +938,11 @@ async def show_statistics(message: types.Message):
     if scheduled_jobs:
         stats_message += f"\n⏰ Active Schedules: {len(scheduled_jobs)}\n"
         for job in list(scheduled_jobs.values())[:3]:
-            time_left = format_timedelta(job.next_run - get_current_time())
+            time_left = format_timedelta(job.next_run - get_current_time()) if job.next_run else "Now"
+            has_media = "📎" if job.media else ""
             stats_message += (
                 f"  • {job.job_id[:6]}... | {len(job.targets)} groups | "
-                f"Every {job.interval}m | Next: {time_left}\n"
+                f"Every {job.interval}m | Next: {time_left} {has_media}\n"
             )
         if len(scheduled_jobs) > 3:
             stats_message += f"  • And {len(scheduled_jobs)-3} more...\n"
@@ -843,7 +960,8 @@ async def show_statistics(message: types.Message):
             premium = "🌟" if session.is_premium else ""
             stats_message += (
                 f"{i}. {premium}{session.name[:10]}... - "
-                f"{session.sent_count} sends\n"
+                f"{session.sent_count} sends | "
+                f"Last used: {format_time(session.last_used) if session.last_used else 'Never'}\n"
             )
     
     try:
@@ -907,10 +1025,12 @@ async def handle_session_upload(msg: types.Message, state: FSMContext):
         is_valid = await validate_session(session_name)
         
         if is_valid:
+            session = active_sessions[session_name]
             await status_msg.edit_text(
                 f"✅ Session {hcode(session_name)} added successfully\n"
-                f"Phone: {active_sessions[session_name].phone or '?'}\n"
-                f"Premium: {'Yes' if active_sessions[session_name].is_premium else 'No'}\n"
+                f"Phone: {session.phone or '?'}\n"
+                f"Premium: {'Yes' if session.is_premium else 'No'}\n"
+                f"Valid: {'Yes' if session.valid else 'No'}\n"
                 f"Total valid sessions now: {sum(1 for s in active_sessions.values() if s.valid)}",
                 reply_markup=main_menu()
             )
@@ -976,7 +1096,9 @@ async def confirm_remove_session(query: types.CallbackQuery):
     session_name = query.data.split("_", 1)[1]
     try:
         await query.message.edit_text(
-            f"Are you sure you want to remove session {hcode(session_name)}?",
+            f"Are you sure you want to remove session {hcode(session_name)}?\n"
+            f"Phone: {active_sessions[session_name].phone or '?'}\n"
+            f"Messages sent: {active_sessions[session_name].sent_count}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [
                     InlineKeyboardButton(
@@ -1068,15 +1190,16 @@ async def manage_job_handler(query: types.CallbackQuery):
         return
     
     job = scheduled_jobs[job_id]
-    time_left = format_timedelta(job.next_run - get_current_time())
+    time_left = format_timedelta(job.next_run - get_current_time()) if job.next_run else "Now"
     
     try:
+        media_info = "\nMedia attached: Yes" if job.media else ""
         await query.message.edit_text(
             f"⏰ Schedule Details:\n\n"
             f"ID: {job.job_id}\n"
             f"Targets: {len(job.targets)} groups\n"
             f"Interval: Every {job.interval} minutes\n"
-            f"Next run: In {time_left}\n\n"
+            f"Next run: In {time_left}{media_info}\n\n"
             f"Message preview:\n{hcode(job.message[:200])}",
             reply_markup=job_management_keyboard(job_id)
         )
@@ -1095,11 +1218,12 @@ async def run_job_handler(query: types.CallbackQuery):
     job = scheduled_jobs[job_id]
     await query.answer("Running job now...")
     
-    result = await send_scheduled_messages(job.job_id, job.targets, job.message)
+    result = await send_scheduled_messages(job.job_id, job.targets, job.message, job.media)
     try:
         await query.message.answer(
             f"✅ Ran schedule {job_id[:6]}...\n"
             f"Sent to {len(job.targets)} groups\n"
+            f"Media: {'Yes' if job.media else 'No'}\n"
             f"Results: {sum(r['sent'] for r in result)} successful, {sum(r['failed'] for r in result)} failed",
             reply_markup=main_menu()
         )
@@ -1162,7 +1286,7 @@ async def save_job_targets(msg: types.Message, state: FSMContext):
     # Update job
     job = scheduled_jobs[job_id]
     job.targets = targets
-    schedule_job(job_id, job.targets, job.message, job.interval)
+    schedule_job(job_id, job.targets, job.message, job.media, job.interval)
     
     await state.clear()
     await msg.answer(
@@ -1209,12 +1333,103 @@ async def save_job_message(msg: types.Message, state: FSMContext):
     # Update job
     job = scheduled_jobs[job_id]
     job.message = message
-    schedule_job(job_id, job.targets, job.message, job.interval)
+    schedule_job(job_id, job.targets, job.message, job.media, job.interval)
     
     await state.clear()
     await msg.answer(
         f"✅ Updated message for schedule {job_id[:6]}...\n"
         f"New message preview: {message[:100]}...",
+        reply_markup=main_menu()
+    )
+
+@router.callback_query(F.data.startswith("edit_media_"))
+async def edit_job_media_handler(query: types.CallbackQuery, state: FSMContext):
+    """Edit job media"""
+    job_id = query.data.split("_", 2)[2]
+    if job_id not in scheduled_jobs:
+        await query.answer("Job not found")
+        return
+    
+    await state.update_data(job_id=job_id)
+    await state.set_state(BotStates.editing_job_media)
+    try:
+        current_media = scheduled_jobs[job_id].media
+        media_status = f"Current media: {current_media}" if current_media else "No media currently attached"
+        await query.message.edit_text(
+            f"🖼 Edit media attachment\n{media_status}\n\n"
+            "Send new media file or /clear to remove current media:",
+            reply_markup=cancel_button()
+        )
+    except Exception as e:
+        logger.error(f"Error editing job media: {e}")
+        await query.answer("Edit media")
+
+@router.message(BotStates.editing_job_media, F.content_type.in_({ContentType.PHOTO, ContentType.VIDEO, ContentType.DOCUMENT}))
+async def save_job_media(msg: types.Message, state: FSMContext):
+    """Save edited job media"""
+    data = await state.get_data()
+    job_id = data.get("job_id")
+    if not job_id or job_id not in scheduled_jobs:
+        await msg.answer("Job not found", reply_markup=main_menu())
+        await state.clear()
+        return
+    
+    try:
+        # Create media folder if not exists
+        if not os.path.exists("media"):
+            os.makedirs("media")
+        
+        # Determine file type and extension
+        if msg.photo:
+            file_id = msg.photo[-1].file_id
+            ext = ".jpg"
+        elif msg.video:
+            file_id = msg.video.file_id
+            ext = ".mp4"
+        elif msg.document:
+            file_id = msg.document.file_id
+            ext = os.path.splitext(msg.document.file_name)[1] if msg.document.file_name else ".bin"
+        
+        # Download the file
+        file = await bot.get_file(file_id)
+        media_path = f"media/{file_id}{ext}"
+        await bot.download_file(file.file_path, media_path)
+        
+        # Update job
+        job = scheduled_jobs[job_id]
+        job.media = media_path
+        schedule_job(job_id, job.targets, job.message, job.media, job.interval)
+        
+        await state.clear()
+        await msg.answer(
+            f"✅ Updated media for schedule {job_id[:6]}...",
+            reply_markup=main_menu()
+        )
+    except Exception as e:
+        logger.error(f"Error saving job media: {e}")
+        await msg.answer(
+            "❌ Failed to update media. Please try again.",
+            reply_markup=cancel_button()
+        )
+
+@router.message(BotStates.editing_job_media, Command("clear"))
+async def clear_job_media(msg: types.Message, state: FSMContext):
+    """Clear job media"""
+    data = await state.get_data()
+    job_id = data.get("job_id")
+    if not job_id or job_id not in scheduled_jobs:
+        await msg.answer("Job not found", reply_markup=main_menu())
+        await state.clear()
+        return
+    
+    # Update job
+    job = scheduled_jobs[job_id]
+    job.media = None
+    schedule_job(job_id, job.targets, job.message, job.media, job.interval)
+    
+    await state.clear()
+    await msg.answer(
+        f"✅ Removed media from schedule {job_id[:6]}...",
         reply_markup=main_menu()
     )
 
@@ -1259,7 +1474,7 @@ async def save_job_interval(msg: types.Message, state: FSMContext):
     # Update job
     job = scheduled_jobs[job_id]
     job.interval = interval
-    schedule_job(job_id, job.targets, job.message, job.interval)
+    schedule_job(job_id, job.targets, job.message, job.media, job.interval)
     
     await state.clear()
     await msg.answer(
@@ -1276,11 +1491,15 @@ async def delete_job_handler(query: types.CallbackQuery):
         await query.answer("Job not found")
         return
     
+    job = scheduled_jobs[job_id]
     try:
+        media_status = "with media" if job.media else "without media"
         await query.message.edit_text(
-            f"Are you sure you want to delete schedule {job_id[:6]}...?\n"
-            f"Targets: {len(scheduled_jobs[job_id].targets)} groups\n"
-            f"Interval: Every {scheduled_jobs[job_id].interval} minutes",
+            f"Are you sure you want to delete this schedule?\n\n"
+            f"ID: {job_id[:6]}...\n"
+            f"Targets: {len(job.targets)} groups\n"
+            f"Interval: Every {job.interval} minutes\n"
+            f"Media: {media_status}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [
                     InlineKeyboardButton(text="✅ Yes", callback_data=f"confirm_delete_{job_id}"),
@@ -1300,7 +1519,8 @@ async def confirm_delete_handler(query: types.CallbackQuery):
         await query.answer("Job not found")
         return
     
-    targets = scheduled_jobs[job_id].targets
+    job = scheduled_jobs[job_id]
+    targets = job.targets
     delete_job(job_id)
     
     try:
@@ -1356,6 +1576,7 @@ async def on_startup():
         OWNER_ID,
         f"🤖 Bot started successfully!\n"
         f"• Sessions: {valid_count}/{len(active_sessions)} active\n"
+        f"• Premium: {premium_count} accounts\n"
         f"• Schedules: {schedule_count} active\n"
         f"• Last target: {campaign_stats.get('target', 'None')}",
         reply_markup=main_menu()
