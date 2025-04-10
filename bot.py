@@ -103,9 +103,8 @@ campaign_stats = {
     "message": ""
 }
 
-# Initialize scheduler
+# Initialize scheduler (will be started in on_startup)
 scheduler = AsyncIOScheduler(timezone="UTC")
-scheduler.start()
 
 # --- Helper Functions ---
 def get_current_time() -> datetime:
@@ -137,7 +136,7 @@ async def save_schedules():
         for job_id, job in scheduled_jobs.items()
     }
     with open(SCHEDULES_FILE, 'w') as f:
-        json.dump(data, f)
+        json.dump(data, f, indent=2)
 
 async def load_schedules():
     """Load scheduled jobs from file"""
@@ -168,7 +167,10 @@ def schedule_job(job_id: str, targets: List[str], message: str, interval: int, n
     
     # Remove existing job if it exists
     if job_id in scheduled_jobs:
-        scheduler.remove_job(job_id)
+        try:
+            scheduler.remove_job(job_id)
+        except Exception as e:
+            logger.warning(f"Error removing job {job_id}: {e}")
     
     job = ScheduledJob(job_id, targets, message, interval, next_run)
     scheduled_jobs[job_id] = job
@@ -186,10 +188,14 @@ def schedule_job(job_id: str, targets: List[str], message: str, interval: int, n
 def delete_job(job_id: str):
     """Remove a scheduled job"""
     if job_id in scheduled_jobs:
-        scheduler.remove_job(job_id)
-        del scheduled_jobs[job_id]
-        asyncio.create_task(save_schedules())
-        return True
+        try:
+            scheduler.remove_job(job_id)
+            del scheduled_jobs[job_id]
+            asyncio.create_task(save_schedules())
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting job {job_id}: {e}")
+            return False
     return False
 
 async def send_scheduled_messages(targets: List[str], message: str):
@@ -239,9 +245,18 @@ async def send_bulk_messages(target: str, message: str) -> Dict[str, int]:
     for i in range(0, total_sessions, BATCH_SIZE):
         batch = valid_sessions[i:i+BATCH_SIZE]
         results = await asyncio.gather(
-            *(send_from_session(s, target, message) for s in batch))
-        sent_count += sum(results)
-        failed_count += len(results) - sum(results)
+            *(send_from_session(s, target, message) for s in batch),
+            return_exceptions=True
+        )
+        
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Error in batch send: {result}")
+                failed_count += 1
+            elif result:
+                sent_count += 1
+            else:
+                failed_count += 1
     
     # Update campaign stats
     campaign_stats["total_sent"] += sent_count
@@ -337,6 +352,18 @@ def edit_job_keyboard(job_id: str) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text="⬅️ Back", callback_data=f"manage_job_{job_id}")]
     ])
+
+def session_selection_keyboard(sessions: List[SessionInfo], action: str) -> InlineKeyboardMarkup:
+    buttons = []
+    for session in sessions:
+        status = "✅" if session.valid else "❌"
+        premium = "🌟" if session.is_premium else ""
+        buttons.append([InlineKeyboardButton(
+            text=f"{status} {premium}{session.name[:15]}... ({session.phone or '?'})",
+            callback_data=f"{action}_{session.name}"
+        )])
+    buttons.append([InlineKeyboardButton(text="⬅️ Back", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # --- Session Management ---
 async def validate_session(session_name: str) -> bool:
@@ -499,12 +526,25 @@ async def send_from_session(session_name: str, target: str, message: str, retry:
             session_info.last_used = get_current_time()
             return True
             
+        except PeerFloodError:
+            logger.warning(f"Peer flood error from {session_name}")
+            session_info.errors += 1
+            return False
+        except FloodWaitError as e:
+            logger.warning(f"Flood wait for {e.seconds} seconds from {session_name}")
+            await asyncio.sleep(e.seconds)
+            return False
+        except (UserPrivacyRestrictedError, UserIsBlockedError):
+            logger.warning(f"Privacy restriction from {session_name}")
+            return False
         except Exception as e:
             logger.warning(f"Send error from {session_name} to {target}: {e}")
+            session_info.errors += 1
             return False
     
     except Exception as e:
         logger.error(f"Connection error in {session_name}: {e}")
+        session_info.errors += 1
         return False
     finally:
         try:
@@ -562,7 +602,8 @@ async def show_full_menu_handler(query: types.CallbackQuery):
             "📋 Main Menu - Select an option:",
             reply_markup=main_menu()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error showing full menu: {e}")
         await query.answer("Main Menu")
 
 @router.callback_query(F.data == "main_menu")
@@ -573,7 +614,8 @@ async def return_to_menu(query: types.CallbackQuery):
             "Main Menu:",
             reply_markup=main_menu()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error returning to menu: {e}")
         await query.answer("Main Menu")
 
 @router.callback_query(F.data == "cancel_action")
@@ -585,7 +627,8 @@ async def cancel_action(query: types.CallbackQuery, state: FSMContext):
             "Action cancelled.",
             reply_markup=main_menu()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error cancelling action: {e}")
         await query.answer("Action cancelled")
 
 @router.callback_query(F.data == "set_target")
@@ -601,7 +644,8 @@ async def set_target_handler(query: types.CallbackQuery, state: FSMContext):
             "- multiple: group1,group2 (for schedules)",
             reply_markup=cancel_button()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error setting target: {e}")
         await query.answer("Send the target username")
 
 @router.message(BotStates.setting_target)
@@ -630,7 +674,8 @@ async def set_message_handler(query: types.CallbackQuery, state: FSMContext):
             "*bold*, _italic_, `code`, [link](url)",
             reply_markup=cancel_button()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error setting message: {e}")
         await query.answer("Send the message text")
 
 @router.message(BotStates.setting_message)
@@ -662,7 +707,8 @@ async def send_messages_handler(query: types.CallbackQuery):
                 "⚠️ Please set both target and message first.",
                 reply_markup=main_menu()
             )
-        except:
+        except Exception as e:
+            logger.error(f"Error in send messages handler: {e}")
             await query.answer("Please set both target and message first.")
         return
     
@@ -673,7 +719,8 @@ async def send_messages_handler(query: types.CallbackQuery):
             f"Message: {hcode(campaign_stats['message'][:50])}...",
             reply_markup=send_options()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error showing send options: {e}")
         await query.answer("Choose sending method")
 
 @router.callback_query(F.data == "send_now")
@@ -681,7 +728,8 @@ async def send_now_handler(query: types.CallbackQuery):
     """Send messages immediately"""
     try:
         await query.message.edit_text("🚀 Sending messages now...")
-    except:
+    except Exception as e:
+        logger.error(f"Error starting send: {e}")
         await query.answer("Sending messages...")
     
     start_time = time.time()
@@ -700,7 +748,8 @@ async def send_now_handler(query: types.CallbackQuery):
             status_message,
             reply_markup=main_menu()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error showing send results: {e}")
         await query.answer(status_message)
 
 @router.callback_query(F.data == "schedule_current")
@@ -712,7 +761,8 @@ async def schedule_current_handler(query: types.CallbackQuery, state: FSMContext
             "⏳ Enter interval in minutes (e.g., 15 for every 15 minutes):",
             reply_markup=cancel_button()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error scheduling message: {e}")
         await query.answer("Enter interval in minutes")
 
 @router.message(BotStates.setting_interval)
@@ -794,7 +844,8 @@ async def show_statistics(message: types.Message):
             stats_message,
             reply_markup=main_menu()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error showing statistics: {e}")
         for chunk in split_long_message(stats_message):
             await message.answer(chunk)
 
@@ -810,7 +861,8 @@ async def add_session_handler(query: types.CallbackQuery, state: FSMContext):
             "Note: The account must be already logged in",
             reply_markup=cancel_button()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error adding session: {e}")
         await query.answer("Please upload a .session file")
 
 @router.message(BotStates.adding_session, F.document)
@@ -862,8 +914,8 @@ async def handle_session_upload(msg: types.Message, state: FSMContext):
             )
             try:
                 os.remove(dest_path)
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Error removing invalid session: {e}")
     except Exception as e:
         logger.error(f"Error adding session: {str(e)}")
         try:
@@ -879,8 +931,8 @@ async def handle_session_upload(msg: types.Message, state: FSMContext):
         try:
             if os.path.exists(dest_path):
                 os.remove(dest_path)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error cleaning up failed session: {e}")
     finally:
         await state.clear()
 
@@ -893,11 +945,12 @@ async def remove_session_handler(query: types.CallbackQuery, state: FSMContext):
                 "No sessions available to remove.",
                 reply_markup=main_menu()
             )
-        except:
+        except Exception as e:
+            logger.error(f"Error removing session: {e}")
             await query.answer("No sessions available")
         return
-    
-    await state.set_state(BotStates.removing_session)
+        
+        await state.set_state(BotStates.removing_session)
     try:
         await query.message.edit_text(
             "Select a session to remove:",
@@ -906,7 +959,8 @@ async def remove_session_handler(query: types.CallbackQuery, state: FSMContext):
                 "remove"
             )
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error showing session removal options: {e}")
         await query.answer("Select a session to remove")
 
 @router.callback_query(F.data.startswith("remove_"))
@@ -929,7 +983,8 @@ async def confirm_remove_session(query: types.CallbackQuery):
                 ]
             ])
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error confirming session removal: {e}")
         await query.answer(f"Confirm removal of {session_name}")
 
 @router.callback_query(F.data.startswith("confirm_remove_"))
@@ -943,7 +998,8 @@ async def execute_remove_session(query: types.CallbackQuery, state: FSMContext):
             message,
             reply_markup=main_menu()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error completing session removal: {e}")
         await query.answer(message)
 
 @router.callback_query(F.data == "refresh_sessions")
@@ -951,7 +1007,8 @@ async def refresh_sessions_handler(query: types.CallbackQuery):
     """Refresh session status"""
     try:
         await query.message.edit_text("🔄 Refreshing session status...")
-    except:
+    except Exception as e:
+        logger.error(f"Error starting session refresh: {e}")
         await query.answer("Refreshing sessions...")
     
     await load_sessions()
@@ -964,7 +1021,8 @@ async def refresh_sessions_handler(query: types.CallbackQuery):
             f"Premium sessions: {sum(1 for s in active_sessions.values() if s.is_premium)}",
             reply_markup=main_menu()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error showing refreshed sessions: {e}")
         await query.answer(f"Sessions refreshed: {valid_count} valid")
 
 # --- Schedule Management Handlers ---
@@ -975,12 +1033,13 @@ async def manage_schedules_handler(query: types.CallbackQuery):
         try:
             await query.message.edit_text(
                 "No active schedules. Create one first.",
-                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="➕ New Schedule", callback_data="schedule_messages")],
                     [InlineKeyboardButton(text="⬅️ Back", callback_data="main_menu")]
                 ])
             )
-        except:
+        except Exception as e:
+            logger.error(f"Error managing schedules: {e}")
             await query.answer("No active schedules")
         return
     
@@ -989,7 +1048,8 @@ async def manage_schedules_handler(query: types.CallbackQuery):
             "⏰ Active Schedules:",
             reply_markup=schedule_keyboard(list(scheduled_jobs.values()))
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error showing schedules: {e}")
         await query.answer("Manage schedules")
 
 @router.callback_query(F.data.startswith("manage_job_"))
@@ -1013,7 +1073,8 @@ async def manage_job_handler(query: types.CallbackQuery):
             f"Message preview:\n{hcode(job.message[:200])}",
             reply_markup=job_management_keyboard(job_id)
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error showing job details: {e}")
         await query.answer("Job details")
 
 @router.callback_query(F.data.startswith("run_job_"))
@@ -1028,12 +1089,16 @@ async def run_job_handler(query: types.CallbackQuery):
     await query.answer("Running job now...")
     
     result = await send_scheduled_messages(job.targets, job.message)
-    await query.message.answer(
-        f"✅ Ran schedule {job_id[:6]}...\n"
-        f"Sent to {len(job.targets)} groups\n"
-        f"Results: {sum(r['sent'] for r in result)} successful, {sum(r['failed'] for r in result)} failed",
-        reply_markup=main_menu()
-    )
+    try:
+        await query.message.answer(
+            f"✅ Ran schedule {job_id[:6]}...\n"
+            f"Sent to {len(job.targets)} groups\n"
+            f"Results: {sum(r['sent'] for r in result)} successful, {sum(r['failed'] for r in result)} failed",
+            reply_markup=main_menu()
+        )
+    except Exception as e:
+        logger.error(f"Error showing job results: {e}")
+        await query.answer("Job completed")
 
 @router.callback_query(F.data.startswith("edit_job_"))
 async def edit_job_handler(query: types.CallbackQuery):
@@ -1048,7 +1113,8 @@ async def edit_job_handler(query: types.CallbackQuery):
             "What would you like to edit?",
             reply_markup=edit_job_keyboard(job_id)
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error editing job: {e}")
         await query.answer("Edit options")
 
 @router.callback_query(F.data.startswith("edit_targets_"))
@@ -1067,7 +1133,8 @@ async def edit_job_targets_handler(query: types.CallbackQuery, state: FSMContext
             f"Current: {', '.join(scheduled_jobs[job_id].targets)}",
             reply_markup=cancel_button()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error editing job targets: {e}")
         await query.answer("Enter new targets")
 
 @router.message(BotStates.editing_job_targets)
@@ -1113,7 +1180,8 @@ async def edit_job_message_handler(query: types.CallbackQuery, state: FSMContext
             f"Current: {scheduled_jobs[job_id].message[:100]}...",
             reply_markup=cancel_button()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error editing job message: {e}")
         await query.answer("Enter new message")
 
 @router.message(BotStates.editing_job_message)
@@ -1128,7 +1196,7 @@ async def save_job_message(msg: types.Message, state: FSMContext):
     
     message = msg.text.strip()
     if not message:
-        await msg.answer("Invalid message, please try again", reply_mup=cancel_button())
+        await msg.answer("Invalid message, please try again", reply_markup=cancel_button())
         return
     
     # Update job
@@ -1159,7 +1227,8 @@ async def change_interval_handler(query: types.CallbackQuery, state: FSMContext)
             f"Current: Every {scheduled_jobs[job_id].interval} minutes",
             reply_markup=cancel_button()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error changing interval: {e}")
         await query.answer("Enter new interval")
 
 @router.message(BotStates.editing_job_interval)
@@ -1212,7 +1281,8 @@ async def delete_job_handler(query: types.CallbackQuery):
                 ]
             ])
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error confirming job deletion: {e}")
         await query.answer("Confirm deletion")
 
 @router.callback_query(F.data.startswith("confirm_delete_"))
@@ -1233,7 +1303,8 @@ async def confirm_delete_handler(query: types.CallbackQuery):
             f"Total active schedules: {len(scheduled_jobs)}",
             reply_markup=main_menu()
         )
-    except:
+    except Exception as e:
+        logger.error(f"Error completing job deletion: {e}")
         await query.answer(f"Deleted schedule {job_id[:6]}...")
 
 # --- Error Handler ---
@@ -1255,9 +1326,12 @@ async def error_handler(event: types.ErrorEvent):
             reply_markup=main_menu()
         )
 
-# --- Startup ---
+# --- Startup and Shutdown ---
 async def on_startup():
     """Initialize the bot with enhanced setup"""
+    # Start scheduler now that we have a running event loop
+    scheduler.start()
+    
     await load_sessions()
     await load_schedules()
     
@@ -1280,9 +1354,19 @@ async def on_startup():
         reply_markup=main_menu()
     )
 
+async def on_shutdown():
+    """Shutdown the bot gracefully"""
+    logger.info("Shutting down scheduler...")
+    try:
+        scheduler.shutdown(wait=False)
+    except Exception as e:
+        logger.error(f"Error shutting down scheduler: {e}")
+    logger.info("Bot shutdown complete")
+
 # --- Main ---
 if __name__ == "__main__":
     dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
     logger.info("Starting bot...")
     
     try:
